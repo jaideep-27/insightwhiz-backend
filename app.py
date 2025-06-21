@@ -1,5 +1,3 @@
-# Updated InsightWhiz Backend (Refactored for Stability + Scalability)
-
 import os
 import json
 import base64
@@ -14,11 +12,10 @@ import firebase_admin
 from firebase_admin import credentials, firestore, auth
 import functools
 from datetime import datetime
+import fitz  # PyMuPDF for PDF parsing
 
-# Setup logging
 logging.basicConfig(level=logging.DEBUG)
 
-# --- Configuration ---
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 FIREBASE_SERVICE_ACCOUNT_KEY_JSON_B64 = os.getenv("FIREBASE_SERVICE_ACCOUNT_KEY_B64")
 LOCAL_FIREBASE_CREDENTIALS_FILE = 'firebase-service-account.json'
@@ -26,7 +23,7 @@ LOCAL_FIREBASE_CREDENTIALS_FILE = 'firebase-service-account.json'
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Firebase Initialization
+# Firebase Init
 cred = None
 if FIREBASE_SERVICE_ACCOUNT_KEY_JSON_B64:
     try:
@@ -48,7 +45,7 @@ except Exception as e:
     logging.error(f"Firebase init failed: {e}")
     db = None
 
-# Gemini Initialization
+# Gemini Init
 gemini_model = None
 if GEMINI_API_KEY:
     try:
@@ -58,7 +55,7 @@ if GEMINI_API_KEY:
     except Exception as e:
         logging.error(f"Gemini init failed: {e}")
 
-# --- Middleware ---
+# Middleware: Auth
 def authenticate_user(f):
     @functools.wraps(f)
     def wrapper(*args, **kwargs):
@@ -81,24 +78,35 @@ def authenticate_user(f):
             return jsonify({"error": "Unauthorized"}), 403
     return wrapper
 
-# --- Utils ---
+# Utils
 def safe_truncate_context(text, word_limit=3000):
     words = text.split()
     if len(words) > word_limit:
         return ' '.join(words[:word_limit]) + "\n...(truncated)"
     return text
 
+def parse_pdf_to_text(pdf_b64):
+    decoded = base64.b64decode(pdf_b64)
+    doc = fitz.open(stream=decoded, filetype="pdf")
+    text = ""
+    for page in doc:
+        text += page.get_text()
+    return text
+
 def parse_data(file_type, b64_data):
-    content = base64.b64decode(b64_data).decode('utf-8')
-    df = None
-    if file_type == 'csv':
-        df = pd.read_csv(io.StringIO(content))
-    elif file_type == 'json':
-        df = pd.read_json(io.StringIO(content))
-    elif file_type == 'text':
-        df = pd.DataFrame({'content': [content]})
+    if file_type == 'pdf':
+        text = parse_pdf_to_text(b64_data)
+        df = pd.DataFrame({'content': [text]})
     else:
-        raise ValueError("Unsupported file type")
+        content = base64.b64decode(b64_data).decode('utf-8')
+        if file_type == 'csv':
+            df = pd.read_csv(io.StringIO(content))
+        elif file_type == 'json':
+            df = pd.read_json(io.StringIO(content))
+        elif file_type == 'text':
+            df = pd.DataFrame({'content': [content]})
+        else:
+            raise ValueError("Unsupported file type")
     df = df.dropna(how='all').fillna('')
     return df
 
@@ -106,13 +114,15 @@ def df_to_context(df):
     context = df.head(500).to_json(orient='records', indent=2)
     return safe_truncate_context(context)
 
-# --- Gemini Calls ---
+# Gemini calls
 def call_gemini_text(prompt):
     if not gemini_model:
         raise Exception("Gemini not initialized")
     try:
-        response = gemini_model.generate_content([{"text": prompt}],
-            generation_config=genai.GenerationConfig(temperature=0.9, top_k=40, top_p=0.95))
+        response = gemini_model.generate_content(
+            [{"text": prompt}],
+            generation_config=genai.GenerationConfig(temperature=0.9, top_k=40, top_p=0.95)
+        )
         return response.text
     except Exception as e:
         logging.error(f"Gemini call error: {e}")
@@ -122,17 +132,20 @@ def call_gemini_json(prompt, schema):
     if not gemini_model:
         raise Exception("Gemini not initialized")
     try:
-        response = gemini_model.generate_content([{"text": prompt}],
+        response = gemini_model.generate_content(
+            [{"text": prompt}],
             generation_config=genai.GenerationConfig(
                 temperature=0.7,
                 response_mime_type="application/json",
-                response_schema=schema))
+                response_schema=schema
+            )
+        )
         return json.loads(response.text)
     except Exception as e:
         logging.error(f"Gemini schema call error: {e}")
         raise Exception("Gemini structured call failed")
 
-# --- Routes ---
+# Routes
 @app.route('/health')
 def health():
     return jsonify({"status": "ok"})
@@ -150,11 +163,17 @@ def upload():
         df = parse_data(file_type, file_content)
         context = df_to_context(df)
 
+        # Auto-label datasets with AI
+        label_prompt = f"Provide 3 short descriptive labels for this dataset based on the content:\n{context}"
+        labels_text = call_gemini_text(label_prompt)
+        labels = [label.strip() for label in labels_text.split('\n') if label.strip()][:3]
+
         doc_ref = db.collection('users').document(user_id).collection('datasets').document()
         doc_ref.set({
             'file_name': file_name,
             'file_type': file_type,
             'data_context': context,
+            'labels': labels,
             'uploaded_at': firestore.SERVER_TIMESTAMP
         })
 
@@ -192,7 +211,8 @@ def upload():
         return jsonify({
             "data_id": doc_ref.id,
             "analysis_text": ai_result['analysis_text'],
-            "chart_data": ai_result['chart_data']
+            "chart_data": ai_result['chart_data'],
+            "labels": labels
         })
     except Exception as e:
         logging.error(f"Upload failed: {e}")
@@ -207,7 +227,8 @@ def ask():
     data_id = data.get('data_id')
 
     try:
-        doc = db.collection('users').document(user_id).collection('datasets').document(data_id).get()
+        doc_ref = db.collection('users').document(user_id).collection('datasets').document(data_id)
+        doc = doc_ref.get()
         if not doc.exists:
             return jsonify({"error": "Data not found"}), 404
 
@@ -222,6 +243,15 @@ def ask():
         Answer strictly based on data. If not possible, say so clearly.
         """
         answer = call_gemini_text(prompt)
+
+        # Save Q&A history
+        qa_collection = doc_ref.collection('qa_history')
+        qa_collection.add({
+            'question': question,
+            'answer': answer,
+            'asked_at': firestore.SERVER_TIMESTAMP
+        })
+
         return jsonify({"answer": answer})
     except Exception as e:
         logging.error(f"Ask failed: {e}")
