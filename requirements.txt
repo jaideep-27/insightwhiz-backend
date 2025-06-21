@@ -5,3 +5,4 @@ pandas==1.3.5
 numpy==1.21.6
 gunicorn==22.0.0
 firebase-admin
+PyMuPDF==1.23.7
