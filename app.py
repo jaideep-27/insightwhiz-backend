@@ -13,6 +13,7 @@ from firebase_admin import credentials, firestore, auth
 import functools
 from datetime import datetime
 import fitz  # PyMuPDF for PDF parsing
+from docx import Document  # For .docx support
 
 logging.basicConfig(level=logging.DEBUG)
 
@@ -93,14 +94,24 @@ def parse_pdf_to_text(pdf_b64):
         text += page.get_text()
     return text
 
+def parse_docx_to_text(docx_b64):
+    decoded = base64.b64decode(docx_b64)
+    doc = Document(io.BytesIO(decoded))
+    return "\n".join([para.text for para in doc.paragraphs])
+
 def parse_data(file_type, b64_data):
     if file_type == 'pdf':
         text = parse_pdf_to_text(b64_data)
+        df = pd.DataFrame({'content': [text]})
+    elif file_type == 'docx':
+        text = parse_docx_to_text(b64_data)
         df = pd.DataFrame({'content': [text]})
     else:
         content = base64.b64decode(b64_data).decode('utf-8')
         if file_type == 'csv':
             df = pd.read_csv(io.StringIO(content))
+        elif file_type == 'xlsx':
+            df = pd.read_excel(io.BytesIO(base64.b64decode(b64_data)))
         elif file_type == 'json':
             df = pd.read_json(io.StringIO(content))
         elif file_type == 'text':
@@ -163,7 +174,6 @@ def upload():
         df = parse_data(file_type, file_content)
         context = df_to_context(df)
 
-        # Auto-label datasets with AI
         label_prompt = f"Provide 3 short descriptive labels for this dataset based on the content:\n{context}"
         labels_text = call_gemini_text(label_prompt)
         labels = [label.strip() for label in labels_text.split('\n') if label.strip()][:3]
@@ -218,12 +228,12 @@ def upload():
         logging.error(f"Upload failed: {e}")
         return jsonify({"error": str(e)}), 500
 
-@app.route('/ask_question', methods=['POST'])
+@app.route('/chat', methods=['POST'])
 @authenticate_user
-def ask():
+def chat():
     data = request.get_json()
     user_id = g.user_id
-    question = data.get('question')
+    message = data.get('message')
     data_id = data.get('data_id')
 
     try:
@@ -234,27 +244,36 @@ def ask():
 
         context = doc.to_dict().get('data_context', '')
 
+        chat_history_ref = doc_ref.collection('qa_history')
+        past_messages = chat_history_ref.order_by('asked_at', direction=firestore.Query.DESCENDING).limit(5).stream()
+        history = ""
+        for msg in reversed(list(past_messages)):
+            msg_data = msg.to_dict()
+            history += f"User: {msg_data['question']}\nAssistant: {msg_data['answer']}\n"
+
         prompt = f"""
-        Based on the dataset:
+        You are a helpful data assistant. Use the dataset below and chat history to answer the user's question.
+
+        Dataset:
         {context}
 
-        User's question: {question}
+        Chat History:
+        {history}
 
-        Answer strictly based on data. If not possible, say so clearly.
+        User's question: {message}
         """
+
         answer = call_gemini_text(prompt)
 
-        # Save Q&A history
-        qa_collection = doc_ref.collection('qa_history')
-        qa_collection.add({
-            'question': question,
+        chat_history_ref.add({
+            'question': message,
             'answer': answer,
             'asked_at': firestore.SERVER_TIMESTAMP
         })
 
         return jsonify({"answer": answer})
     except Exception as e:
-        logging.error(f"Ask failed: {e}")
+        logging.error(f"Chat failed: {e}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
