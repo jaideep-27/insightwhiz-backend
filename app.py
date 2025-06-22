@@ -22,7 +22,7 @@ FIREBASE_SERVICE_ACCOUNT_KEY_JSON_B64 = os.getenv("FIREBASE_SERVICE_ACCOUNT_KEY_
 LOCAL_FIREBASE_CREDENTIALS_FILE = 'firebase-service-account.json'
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app, resources={r"/": {"origins": ""}}, allow_headers=['Content-Type', 'Authorization'])
 
 # Firebase Init
 cred = None
@@ -60,8 +60,9 @@ if GEMINI_API_KEY:
 def authenticate_user(f):
     @functools.wraps(f)
     def wrapper(*args, **kwargs):
-        if request.path == '/health':
+        if request.method == 'OPTIONS' or request.path == '/health':
             return f(*args, **kwargs)
+
         auth_header = request.headers.get('Authorization')
         if not auth_header:
             return jsonify({"error": "Missing Authorization header"}), 401
@@ -161,9 +162,12 @@ def call_gemini_json(prompt, schema):
 def health():
     return jsonify({"status": "ok"})
 
-@app.route('/upload_data', methods=['POST'])
+@app.route('/upload_data', methods=['POST', 'OPTIONS'])
 @authenticate_user
 def upload():
+    if request.method == 'OPTIONS':
+        return jsonify({"message": "Preflight success"}), 200
+
     data = request.get_json()
     user_id = g.user_id
     file_type = data.get('file_type')
